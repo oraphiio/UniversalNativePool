@@ -281,6 +281,12 @@ A runtime warning `Channel 'x' hit capacity! Executing chunk allocation block (+
 
 <!-- TODO: add your license file and reference it here, e.g. MIT -->
 
+
+USED GOOGLE SEARCH AI to make the code
+partial cleanup with qwen
+<img width="877" height="955" alt="image" src="https://github.com/user-attachments/assets/48ff3905-736a-4de9-9629-05dfb00c9ebc" />
+
+
 ---
 
 *Built with [godot-rust / gdext](https://github.com/godot-rust/gdext) 0.5.5 · Targets Godot 4.7 – 4.8 · Rust edition 2024*
