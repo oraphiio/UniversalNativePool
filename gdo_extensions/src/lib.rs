@@ -49,15 +49,27 @@ fn activate_entity(mut node: Gd<Node>) {
 
 /// Applies harvested transform data to a newly spawned node.
 fn apply_harvested_transform(entity: &Gd<Node>, data: &HarvestedSpatialData) {
+    let root_node = entity.clone();
+
     match data {
         HarvestedSpatialData::Spatial3D { transform } => {
-            if let Ok(mut node_3d) = entity.clone().try_cast::<Node3D>() {
+            if let Ok(mut node_3d) = root_node.try_cast::<Node3D>() {
                 node_3d.set_global_transform(*transform);
                 node_3d.set_visible(true);
+
+                // VERBOSE DEBUG HOOK: Log the exact world placement where the node is positioned
+                let origin = transform.origin;
+                godot_print!(
+                    "🔧 [RUST DEBUG]: Re-deploying spatial node '{}' to World Positions -> X: {:.2}, Y: {:.2}, Z: {:.2}",
+                    entity.get_name(),
+                    origin.x,
+                    origin.y,
+                    origin.z
+                );
             }
         }
         HarvestedSpatialData::Canvas2D { transform } => {
-            if let Ok(mut node_2d) = entity.clone().try_cast::<Node2D>() {
+            if let Ok(mut node_2d) = root_node.try_cast::<Node2D>() {
                 node_2d.set_global_transform(*transform);
                 node_2d.set_visible(true);
             }
@@ -196,6 +208,7 @@ impl UniversalNativePool {
         let children = self.base().get_children();
 
         for child in children.iter_shared() {
+            let channel_container: Gd<Node> = child.clone();
             let Ok(channel_node) = child.try_cast::<NativePoolChannel>() else {
                 continue;
             };
@@ -221,12 +234,14 @@ impl UniversalNativePool {
             self.active_registry.insert(pool_key.clone(), Vec::new());
 
             // Pre-allocation block (Borrow-checker safe)
+            // Pre-allocation block (Parented safely to channel container branch node)
             if size > 0 {
                 let mut allocated = Vec::with_capacity(size as usize);
                 for _ in 0..size {
                     if let Some(entity) = blueprint.instantiate() {
                         deactivate_entity(entity.clone());
-                        self.base_mut().add_child(&entity);
+                        let mut mut_channel = channel_node.clone();
+                        mut_channel.add_child(&entity);
                         allocated.push(entity);
                     }
                 }
@@ -257,9 +272,11 @@ impl UniversalNativePool {
             self.harvest_cache
                 .insert(pool_key.clone(), collected_transforms.clone());
 
-            // Apply harvested layouts to active pool nodes
+            // Apply harvested layouts to active pool nodes parented under the channel container
             for spatial_data in collected_transforms {
-                if let Some(active_node) = self.spawn_from_pool_internal(&pool_key) {
+                if let Some(active_node) =
+                    self.spawn_from_pool_internal(&pool_key, &channel_container)
+                {
                     apply_harvested_transform(&active_node, &spatial_data);
 
                     if let Some(active_vec) = self.active_registry.get_mut(&pool_key) {
@@ -277,14 +294,14 @@ impl UniversalNativePool {
         }
     }
 
-    fn spawn_from_pool_internal(&mut self, key: &str) -> Option<Gd<Node>> {
+    fn spawn_from_pool_internal(&mut self, key: &str, channel_node: &Gd<Node>) -> Option<Gd<Node>> {
         if !self.pool_registry.contains_key(key) {
             return None;
         }
 
         let pool_empty = self.pool_registry.get(key).map_or(true, |v| v.is_empty());
 
-        // Dynamic Chunk Expansion (+32 Block allocation step to protect frame time consistency)
+        // Dynamic Chunk Expansion (+32 Block allocation step parented to the channel node context)
         if pool_empty {
             if let Some(blueprint) = self.scene_blueprints.get(key).cloned() {
                 godot_warn!(
@@ -295,7 +312,9 @@ impl UniversalNativePool {
                 for _ in 0..32 {
                     if let Some(entity) = blueprint.instantiate() {
                         deactivate_entity(entity.clone());
-                        self.base_mut().add_child(&entity);
+                        // Parent explicitly to the channel container node path block
+                        let mut mut_channel = channel_node.clone();
+                        mut_channel.add_child(&entity);
                         temp_allocated.push(entity);
                     }
                 }
@@ -325,7 +344,10 @@ impl UniversalNativePool {
             return None;
         }
 
-        if let Some(entity) = self.spawn_from_pool_internal(&key_str) {
+        // Fetch the active container node branch dynamically out of the children tree
+        let channel_node = self.base().get_node_or_null(&key_str)?;
+
+        if let Some(entity) = self.spawn_from_pool_internal(&key_str, &channel_node) {
             if let Ok(mut s3d) = entity.clone().try_cast::<Node3D>() {
                 s3d.set_global_position(global_position);
                 s3d.set_visible(true);
@@ -391,8 +413,15 @@ impl UniversalNativePool {
         }
 
         if let Some(cached_transforms) = self.harvest_cache.get(&key).cloned() {
+            let Some(channel_node) = self.base().get_node_or_null(&key) else {
+                godot_error!(
+                    "UniversalNativePool: reset aborted - channel node '{}' not found in tree.",
+                    key
+                );
+                return;
+            };
             for spatial_data in cached_transforms {
-                if let Some(active_node) = self.spawn_from_pool_internal(&key) {
+                if let Some(active_node) = self.spawn_from_pool_internal(&key, &channel_node) {
                     apply_harvested_transform(&active_node, &spatial_data);
 
                     if let Some(active_vec) = self.active_registry.get_mut(&key) {
