@@ -4,33 +4,84 @@ use std::collections::HashMap;
 // =============================================================================
 // GDEXTENSION HANDSHAKE CONFIGURATION
 // =============================================================================
-struct GDExtensionEntry;
+struct UniversalPoolLibrary;
 
-#[gdextension]
-unsafe impl ExtensionLibrary for GDExtensionEntry {}
+// SUCCESS: The modern macro parameter uses an unquoted token that
+// maps directly to entry_symbol inside your .gdextension file!
+#[gdextension(entry_symbol = gdext_rust_init)]
+unsafe impl ExtensionLibrary for UniversalPoolLibrary {}
 
 // =============================================================================
-// NODE 1: THE CHILD ARCHETYPE SPECIFICATION NODE
+// HELPER FUNCTIONS FOR SAFE CASTING & STATE MANAGEMENT
 // =============================================================================
-/// This node represents an individual asset category folder in the scene tree hierarchy.
-/// Inherits from generic Node to cleanly support both Node2D and Node3D asset arrays.
+
+/// Safely deactivates an entity and all its child components recursively.
+fn deactivate_entity(mut node: Gd<Node>) {
+    node.set_process(false);
+    node.set_physics_process(false);
+    node.set_process_internal(false);
+    node.set_physics_process_internal(false);
+
+    if let Ok(mut node_3d) = node.clone().try_cast::<Node3D>() {
+        node_3d.set_visible(false);
+    } else if let Ok(mut node_2d) = node.clone().try_cast::<Node2D>() {
+        node_2d.set_visible(false);
+    }
+
+    let children = node.get_children();
+    for child in children.iter_shared() {
+        deactivate_entity(child);
+    }
+}
+
+/// Safely reactivates an entity and all its child components recursively.
+fn activate_entity(mut node: Gd<Node>) {
+    node.set_process(true);
+    node.set_physics_process(true);
+    node.set_process_internal(true);
+    node.set_physics_process_internal(true);
+
+    let children = node.get_children();
+    for child in children.iter_shared() {
+        activate_entity(child);
+    }
+}
+
+/// Applies harvested transform data to a newly spawned node.
+fn apply_harvested_transform(entity: &Gd<Node>, data: &HarvestedSpatialData) {
+    match data {
+        HarvestedSpatialData::Spatial3D { transform } => {
+            if let Ok(mut node_3d) = entity.clone().try_cast::<Node3D>() {
+                node_3d.set_global_transform(*transform);
+                node_3d.set_visible(true);
+            }
+        }
+        HarvestedSpatialData::Canvas2D { transform } => {
+            if let Ok(mut node_2d) = entity.clone().try_cast::<Node2D>() {
+                node_2d.set_global_transform(*transform);
+                node_2d.set_visible(true);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// NODE 1: THE CHILD CHANNEL SPECIFICATION NODE
+// =============================================================================
 #[derive(GodotClass)]
 #[class(base=Node)]
-pub struct NativePoolArchetype {
+pub struct NativePoolChannel {
     base: Base<Node>,
 
-    /// The visual prefab file layout configuration resource (.tscn)
     #[export]
     pub blueprint_scene: Option<Gd<PackedScene>>,
 
-    /// The total target storage capacity to allocate up front at boot.
-    /// If left at 0, this specific channel shifts to runtime lazy loading growth!
-    #[export]
+    #[export(range = (0.0, 50000.0))]
     pub pre_alloc_size: i32,
 }
 
 #[godot_api]
-impl INode for NativePoolArchetype {
+impl INode for NativePoolChannel {
     fn init(base: Base<Node>) -> Self {
         Self {
             base,
@@ -41,6 +92,15 @@ impl INode for NativePoolArchetype {
 }
 
 // =============================================================================
+// INTERNAL HARVEST TRANSFORMS MEMORY ARCHITECTURE
+// =============================================================================
+#[derive(Clone, Copy)]
+enum HarvestedSpatialData {
+    Spatial3D { transform: Transform3D },
+    Canvas2D { transform: Transform2D },
+}
+
+// =============================================================================
 // NODE 2: THE MASTER DICTIONARY SYSTEM CONTROL POOL
 // =============================================================================
 #[derive(GodotClass)]
@@ -48,11 +108,20 @@ impl INode for NativePoolArchetype {
 pub struct UniversalNativePool {
     base: Base<Node>,
 
-    /// Master Cache Mapping: String Key -> Vector array of resting, unmanaged Node asset instances
     pool_registry: HashMap<String, Vec<Gd<Node>>>,
-
-    /// Master Reference Mapping: String Key -> Scene asset configuration profile recipes
+    active_registry: HashMap<String, Vec<Gd<Node>>>,
     scene_blueprints: HashMap<String, Gd<PackedScene>>,
+    harvest_cache: HashMap<String, Vec<HarvestedSpatialData>>,
+
+    #[export]
+    pub trigger_pool_diagnostic_print: bool,
+
+    // GString is the canonical type for Godot-facing exported strings
+    #[export]
+    pub target_debug_channel_name: GString,
+
+    #[export]
+    pub trigger_channel_reset_now: bool,
 }
 
 #[godot_api]
@@ -61,168 +130,310 @@ impl INode for UniversalNativePool {
         Self {
             base,
             pool_registry: HashMap::new(),
+            active_registry: HashMap::new(),
             scene_blueprints: HashMap::new(),
+            harvest_cache: HashMap::new(),
+            trigger_pool_diagnostic_print: false,
+            target_debug_channel_name: GString::new(),
+            trigger_channel_reset_now: false,
         }
     }
 
     fn ready(&mut self) {
-        godot_print!("UniversalNativePool v1.0 [Modular Core Pipeline Active]");
-        self.initialize_and_harvest_archetypes();
+        godot_print!("UniversalNativePool v1.03 [Harvest & Checkpoint Reset Engine Active]");
+        self.initialize_and_harvest_channels();
     }
-}
 
-#[godot_api]
-impl UniversalNativePool {
-    /// Internal automated initialization loop.
-    /// Scans its immediate child tree for NativePoolArchetype nodes to build memory channels.
-    fn initialize_and_harvest_archetypes(&mut self) {
-        let children = self.base().get_children();
+    fn process(&mut self, _delta: f64) {
+        if self.trigger_pool_diagnostic_print {
+            self.trigger_pool_diagnostic_print = false;
+            self.print_pool_diagnostics();
+        }
 
-        for child in children.iter_shared() {
-            // Safe downcast verification: Is this child a custom NativePoolArchetype?
-            if let Ok(archetype_node) = child.try_cast::<NativePoolArchetype>() {
-                // Derives the tracking dictionary key string directly from the node's custom name!
-                let pool_key = archetype_node.get_name().to_string();
-                let (blueprint_opt, size) = {
-                    let bind = archetype_node.bind();
-                    (bind.blueprint_scene.clone(), bind.pre_alloc_size)
-                };
+        if self.trigger_channel_reset_now {
+            self.trigger_channel_reset_now = false;
+            let channel = self.target_debug_channel_name.to_string();
 
-                let Some(blueprint) = blueprint_opt else {
-                    godot_error!("UniversalNativePool Error: Archetype Node '{}' has no .tscn blueprint assigned!", pool_key);
-                    continue;
-                };
-
-                if !blueprint.is_instance_valid() {
-                    godot_error!("UniversalNativePool Error: Archetype Node '{}' has no valid .tscn blueprint assigned!", pool_key);
-                    continue;
-                }
-
-                // Register blueprint profile memory
-                self.scene_blueprints
-                    .insert(pool_key.clone(), blueprint.clone());
-
-                let mut storage_vector = Vec::new();
-                if size > 0 {
-                    storage_vector.reserve(size as usize);
-                    for _ in 0..size {
-                        if let Some(instance) = blueprint.instantiate() {
-                            let mut entity = instance;
-
-                            // Put entity into a low-overhead deep dormancy state
-                            entity.set_process(false);
-                            entity.set_physics_process(false);
-
-                            // Safe visual deactivation checks across both 2D and 3D node variants
-                            if let Ok(mut spatial_3d) = entity.clone().try_cast::<Node3D>() {
-                                spatial_3d.set_visible(false);
-                            } else if let Ok(mut canvas_2d) = entity.clone().try_cast::<Node2D>() {
-                                canvas_2d.set_visible(false);
-                            }
-
-                            // Secure node handle nested under the active structural layout tree root
-                            self.base_mut().add_child(&entity);
-
-                            storage_vector.push(entity);
-                        }
-                    }
-                }
-
-                self.pool_registry.insert(pool_key.clone(), storage_vector);
-                godot_print!(
-                    "UniversalNativePool: Channel '{}' pre-allocated with {} elements.",
-                    pool_key,
-                    size
+            if !channel.is_empty() {
+                self.reset_channel_internal(channel);
+            } else {
+                godot_error!(
+                    "UniversalNativePool Inspector Error: Enter a channel name in 'target_debug_channel_name'!"
                 );
             }
         }
     }
 
-    // =============================================================================
-    // THE SEAMLESS PROGRAMMER SCRIPT BRIDGE API INTERFACE
-    // =============================================================================
+    // STABILIZATION 1: LEVEL TEARDOWN MEMORY FLUSH
+    // Automatically triggers when changing scenes, preventing cross-level memory leaks!
 
-    /// Click-Clack Spawning Bridge: Pulls a dynamic or pre-allocated object handle instantly
-    #[func]
-    pub fn spawn(&mut self, key: String, global_position: Vector3) -> Option<Gd<Node>> {
-        if !self.pool_registry.contains_key(&key) {
-            godot_error!(
-                "UniversalNativePool API: Request key '{}' does not exist in registry map!",
-                key
+    fn exit_tree(&mut self) {
+        godot_print!("UniversalNativePool: Cleaning up memory footprint for scene transition...");
+
+        for (_, vector) in self.pool_registry.drain() {
+            for mut entity in vector {
+                if entity.is_instance_valid() {
+                    entity.queue_free();
+                }
+            }
+        }
+        for (_, vector) in self.active_registry.drain() {
+            for mut entity in vector {
+                if entity.is_instance_valid() {
+                    entity.queue_free();
+                }
+            }
+        }
+        self.scene_blueprints.clear();
+        self.harvest_cache.clear();
+    }
+}
+
+#[godot_api]
+impl UniversalNativePool {
+    fn initialize_and_harvest_channels(&mut self) {
+        self.base_mut().set_process(true);
+        let children = self.base().get_children();
+
+        for child in children.iter_shared() {
+            let Ok(channel_node) = child.try_cast::<NativePoolChannel>() else {
+                continue;
+            };
+
+            let pool_key = channel_node.get_name().to_string();
+
+            let (blueprint_opt, size) = {
+                let bind = channel_node.bind();
+                (bind.blueprint_scene.clone(), bind.pre_alloc_size)
+            };
+
+            let Some(blueprint) = blueprint_opt else {
+                continue;
+            };
+
+            if !blueprint.is_instance_valid() {
+                continue;
+            }
+
+            self.scene_blueprints
+                .insert(pool_key.clone(), blueprint.clone());
+            self.pool_registry.insert(pool_key.clone(), Vec::new());
+            self.active_registry.insert(pool_key.clone(), Vec::new());
+
+            // Pre-allocation block (Borrow-checker safe)
+            if size > 0 {
+                let mut allocated = Vec::with_capacity(size as usize);
+                for _ in 0..size {
+                    if let Some(entity) = blueprint.instantiate() {
+                        deactivate_entity(entity.clone());
+                        self.base_mut().add_child(&entity);
+                        allocated.push(entity);
+                    }
+                }
+                if let Some(pool) = self.pool_registry.get_mut(&pool_key) {
+                    pool.extend(allocated);
+                }
+            }
+
+            // Harvest placeholders
+            let placeholders = channel_node.get_children();
+            let mut collected_transforms = Vec::new();
+
+            for placeholder in placeholders.iter_shared() {
+                if let Ok(spatial_3d) = placeholder.clone().try_cast::<Node3D>() {
+                    collected_transforms.push(HarvestedSpatialData::Spatial3D {
+                        transform: spatial_3d.get_global_transform(),
+                    });
+                } else if let Ok(canvas_2d) = placeholder.clone().try_cast::<Node2D>() {
+                    collected_transforms.push(HarvestedSpatialData::Canvas2D {
+                        transform: canvas_2d.get_global_transform(),
+                    });
+                }
+                let mut removable = placeholder;
+                removable.queue_free();
+            }
+
+            let total_harvested = collected_transforms.len();
+            self.harvest_cache
+                .insert(pool_key.clone(), collected_transforms.clone());
+
+            // Apply harvested layouts to active pool nodes
+            for spatial_data in collected_transforms {
+                if let Some(active_node) = self.spawn_from_pool_internal(&pool_key) {
+                    apply_harvested_transform(&active_node, &spatial_data);
+
+                    if let Some(active_vec) = self.active_registry.get_mut(&pool_key) {
+                        active_vec.push(active_node);
+                    }
+                }
+            }
+
+            godot_print!(
+                "UniversalNativePool: Channel '{}' compiled and active. Pre-allocated: {}, Harvested: {}.",
+                pool_key,
+                size,
+                total_harvested
             );
+        }
+    }
+
+    fn spawn_from_pool_internal(&mut self, key: &str) -> Option<Gd<Node>> {
+        if !self.pool_registry.contains_key(key) {
             return None;
         }
 
-        // Automatic Emergency Overflow Strategy: Lazy load expansion if vector arrays run dry
-        let is_empty = self.pool_registry.get(&key).is_none_or(|v| v.is_empty());
-        if is_empty {
-            if let Some(blueprint) = self.scene_blueprints.get(&key).cloned() {
-                if let Some(instance) = blueprint.instantiate() {
-                    let mut entity = instance;
-                    entity.set_process(false);
-                    entity.set_physics_process(false);
+        let pool_empty = self.pool_registry.get(key).map_or(true, |v| v.is_empty());
 
-                    if let Ok(mut spatial_3d) = entity.clone().try_cast::<Node3D>() {
-                        spatial_3d.set_visible(false);
-                    } else if let Ok(mut canvas_2d) = entity.clone().try_cast::<Node2D>() {
-                        canvas_2d.set_visible(false);
+        // Dynamic Chunk Expansion (+32 Block allocation step to protect frame time consistency)
+        if pool_empty {
+            if let Some(blueprint) = self.scene_blueprints.get(key).cloned() {
+                godot_warn!(
+                    "UniversalNativePool: Channel '{}' hit capacity! Executing chunk allocation block (+32 instances)...",
+                    key
+                );
+                let mut temp_allocated = Vec::with_capacity(32);
+                for _ in 0..32 {
+                    if let Some(entity) = blueprint.instantiate() {
+                        deactivate_entity(entity.clone());
+                        self.base_mut().add_child(&entity);
+                        temp_allocated.push(entity);
                     }
+                }
 
-                    self.base_mut().add_child(&entity);
-
-                    if let Some(vector) = self.pool_registry.get_mut(&key) {
-                        vector.push(entity);
-                    }
+                if let Some(pool) = self.pool_registry.get_mut(key) {
+                    pool.extend(temp_allocated);
                 }
             }
         }
 
-        // Fetch handle instance tracking elements from the unmanaged caching backend arrays
-        if let Some(vector) = self.pool_registry.get_mut(&key) {
-            if let Some(mut entity) = vector.pop() {
-                // Route target global transform coordinates depending on spatial orientation profile
-                if let Ok(mut spatial_3d) = entity.clone().try_cast::<Node3D>() {
-                    spatial_3d.set_global_position(global_position);
-                    spatial_3d.set_visible(true);
-                } else if let Ok(mut canvas_2d) = entity.clone().try_cast::<Node2D>() {
-                    // Truncates Vector3 position elements seamlessly for standard 2D view layouts
-                    canvas_2d
-                        .set_global_position(Vector2::new(global_position.x, global_position.y));
-                    canvas_2d.set_visible(true);
+        if let Some(pool) = self.pool_registry.get_mut(key) {
+            while let Some(entity) = pool.pop() {
+                if entity.is_instance_valid() {
+                    activate_entity(entity.clone());
+                    return Some(entity);
                 }
-
-                // Awakening entity logic sweeps
-                entity.set_process(true);
-                entity.set_physics_process(true);
-
-                return Some(entity);
             }
         }
 
         None
     }
 
-    /// Click-Clack Recycling Bridge: Pushes an active element straight back down into unmanaged caches
     #[func]
-    pub fn despawn(&mut self, key: String, mut entity: Gd<Node>) {
-        if let Some(vector) = self.pool_registry.get_mut(&key) {
-            // Put processing logic states back to sleep safely
-            entity.set_process(false);
-            entity.set_physics_process(false);
+    pub fn spawn(&mut self, key: GString, global_position: Vector3) -> Option<Gd<Node>> {
+        let key_str = key.to_string();
+        if !self.pool_registry.contains_key(&key_str) {
+            return None;
+        }
 
-            if let Ok(mut spatial_3d) = entity.clone().try_cast::<Node3D>() {
-                spatial_3d.set_visible(false);
-            } else if let Ok(mut canvas_2d) = entity.clone().try_cast::<Node2D>() {
-                canvas_2d.set_visible(false);
+        if let Some(entity) = self.spawn_from_pool_internal(&key_str) {
+            if let Ok(mut s3d) = entity.clone().try_cast::<Node3D>() {
+                s3d.set_global_position(global_position);
+                s3d.set_visible(true);
+            } else if let Ok(mut c2d) = entity.clone().try_cast::<Node2D>() {
+                c2d.set_global_position(Vector2::new(global_position.x, global_position.y));
+                c2d.set_visible(true);
             }
 
-            // Slide reference back onto structural unmanaged vector array registers
+            if let Some(active_vec) = self.active_registry.get_mut(&key_str) {
+                active_vec.push(entity.clone());
+            }
+            return Some(entity);
+        }
+        None
+    }
+
+    #[func]
+    pub fn despawn(&mut self, key: GString, entity: Gd<Node>) {
+        let key_str = key.to_string();
+
+        if !entity.is_instance_valid() {
+            return;
+        }
+
+        if let Some(vector) = self.pool_registry.get_mut(&key_str) {
+            if vector.contains(&entity) {
+                return; // Already dormant
+            }
+
+            deactivate_entity(entity.clone());
+
+            if let Some(active_vec) = self.active_registry.get_mut(&key_str) {
+                if let Some(index) = active_vec.iter().position(|x| *x == entity) {
+                    active_vec.swap_remove(index);
+                }
+            }
             vector.push(entity);
-        } else {
-            godot_error!(
-                "UniversalNativePool API: Direct Despawn failure. Invalid target key channel '{}'",
-                key
+        }
+    }
+
+    // Internal logic for reset to avoid GString borrowing issues in process()
+    fn reset_channel_internal(&mut self, key: String) {
+        if !self.pool_registry.contains_key(&key) {
+            return;
+        }
+
+        let active_nodes: Vec<Gd<Node>> = self
+            .active_registry
+            .get_mut(&key)
+            .map(|v| v.drain(..).collect())
+            .unwrap_or_default();
+
+        if let Some(dormant_vec) = self.pool_registry.get_mut(&key) {
+            for entity in active_nodes {
+                if !entity.is_instance_valid() {
+                    continue;
+                }
+                deactivate_entity(entity.clone());
+                if !dormant_vec.contains(&entity) {
+                    dormant_vec.push(entity);
+                }
+            }
+        }
+
+        if let Some(cached_transforms) = self.harvest_cache.get(&key).cloned() {
+            for spatial_data in cached_transforms {
+                if let Some(active_node) = self.spawn_from_pool_internal(&key) {
+                    apply_harvested_transform(&active_node, &spatial_data);
+
+                    if let Some(active_vec) = self.active_registry.get_mut(&key) {
+                        active_vec.push(active_node);
+                    }
+                }
+            }
+        }
+
+        godot_print!(
+            "UniversalNativePool: Channel '{}' successfully reset to layout targets.",
+            key
+        );
+    }
+
+    #[func]
+    pub fn reset_channel(&mut self, key: GString) {
+        self.reset_channel_internal(key.to_string());
+    }
+
+    #[func]
+    pub fn get_active_count(&self, key: GString) -> i32 {
+        let key_str = key.to_string();
+        self.active_registry
+            .get(&key_str)
+            .map_or(0, |v| v.len() as i32)
+    }
+
+    fn print_pool_diagnostics(&self) {
+        godot_print!("--- UNIVERSAL NATIVE POOL DIAGNOSTIC READOUT ---");
+        for (key, dormant_vec) in &self.pool_registry {
+            let active_count = self.active_registry.get(key).map_or(0, |v| v.len());
+            let harvest_count = self.harvest_cache.get(key).map_or(0, |v| v.len());
+            godot_print!(
+                " -> Channel [{}]: Dormant Matrix: {}, Active Wild: {}, Level Layout Restarts Cached: {}",
+                key,
+                dormant_vec.len(),
+                active_count,
+                harvest_count
             );
         }
+        godot_print!("------------------------------------------------");
     }
 }
