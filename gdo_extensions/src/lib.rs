@@ -27,11 +27,6 @@ fn deactivate_entity(mut node: Gd<Node>) {
     } else if let Ok(mut node_2d) = node.clone().try_cast::<Node2D>() {
         node_2d.set_visible(false);
     }
-
-    let children = node.get_children();
-    for child in children.iter_shared() {
-        deactivate_entity(child);
-    }
 }
 
 /// Safely reactivates an entity and all its child components recursively.
@@ -41,9 +36,10 @@ fn activate_entity(mut node: Gd<Node>) {
     node.set_process_internal(true);
     node.set_physics_process_internal(true);
 
-    let children = node.get_children();
-    for child in children.iter_shared() {
-        activate_entity(child);
+    if let Ok(mut node_3d) = node.clone().try_cast::<Node3D>() {
+        node_3d.set_visible(true);
+    } else if let Ok(mut node_2d) = node.clone().try_cast::<Node2D>() {
+        node_2d.set_visible(true);
     }
 }
 
@@ -233,24 +229,7 @@ impl UniversalNativePool {
             self.pool_registry.insert(pool_key.clone(), Vec::new());
             self.active_registry.insert(pool_key.clone(), Vec::new());
 
-            // Pre-allocation block (Borrow-checker safe)
-            // Pre-allocation block (Parented safely to channel container branch node)
-            if size > 0 {
-                let mut allocated = Vec::with_capacity(size as usize);
-                for _ in 0..size {
-                    if let Some(entity) = blueprint.instantiate() {
-                        deactivate_entity(entity.clone());
-                        let mut mut_channel = channel_node.clone();
-                        mut_channel.add_child(&entity);
-                        allocated.push(entity);
-                    }
-                }
-                if let Some(pool) = self.pool_registry.get_mut(&pool_key) {
-                    pool.extend(allocated);
-                }
-            }
-
-            // Harvest placeholders
+            // Harvest placeholders FIRST (before pre-allocation)
             let placeholders = channel_node.get_children();
             let mut collected_transforms = Vec::new();
 
@@ -266,6 +245,22 @@ impl UniversalNativePool {
                 }
                 let mut removable = placeholder;
                 removable.queue_free();
+            }
+            // Pre-allocation block (Borrow-checker safe)
+            // Pre-allocation block (Parented safely to channel container branch node)
+            if size > 0 {
+                let mut allocated = Vec::with_capacity(size as usize);
+                for _ in 0..size {
+                    if let Some(entity) = blueprint.instantiate() {
+                        deactivate_entity(entity.clone());
+                        let mut mut_channel = channel_node.clone();
+                        mut_channel.add_child(&entity);
+                        allocated.push(entity);
+                    }
+                }
+                if let Some(pool) = self.pool_registry.get_mut(&pool_key) {
+                    pool.extend(allocated);
+                }
             }
 
             let total_harvested = collected_transforms.len();
