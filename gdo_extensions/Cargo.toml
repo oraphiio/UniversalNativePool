@@ -1,0 +1,11 @@
+[package]
+name = "gdo_extensions"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"] # Crucial: Tells Rust to output a generic C-compatible .dll
+
+[dependencies]
+# Pulls down the modern godot-rust library for Godot 4.x
+godot = { version = "0.5.5", features = ["experimental-threads"] }
